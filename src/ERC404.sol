@@ -169,8 +169,8 @@ abstract contract ERC404 is Ownable, IERC404 {
     mapping(address => uint256[]) internal _owned;
 
     /// @dev bytes array to keep track of token ids owned by a user
-    /// token ids are stored in 4 byte chuncks are is safe until id's over 4 billion
-    /// if needed this can be expanded on more gas efficent chains than mainnet ethereum.
+    /// token ids are stored in 4 byte chuncks and are safe until id's over 4 billion.
+    /// If needed this can be expanded on more gas efficent chains than mainnet ethereum.
     mapping(address => bytes) public _ownedIds;
 
     /// @dev Tracks indices for the _owned mapping
