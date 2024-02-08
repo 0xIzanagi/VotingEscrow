@@ -282,40 +282,76 @@ abstract contract ERC404 is Ownable, IERC404 {
     /// @dev This function assumes id / native if amount less than or equal to current max id
     function transferFrom(address from, address to, uint256 amountOrId) public virtual {
         if (amountOrId <= minted) {
-            if (from != _ownerOf[amountOrId]) {
-                revert InvalidSender();
+            uint256 prevOwnershipPacked = _packedOwnershipOf(amountOrId);
+
+            // Mask `from` to the lower 160 bits, in case the upper bits somehow aren't clean.
+            from = address(uint160(uint256(uint160(from)) & _BITMASK_ADDRESS));
+
+            if (address(uint160(prevOwnershipPacked)) != from) _revert(TransferFromIncorrectOwner.selector);
+
+            (uint256 approvedAddressSlot, address approvedAddress) = _getApprovedSlotAndAddress(amountOrId);
+
+            // The nested ifs save around 20+ gas over a compound boolean condition.
+            if (!_isSenderApprovedOrOwner(approvedAddress, from, _msgSenderERC721A())) {
+                if (!isApprovedForAll[from][_msgSenderERC721A()]) _revert(TransferCallerNotOwnerNorApproved.selector);
             }
 
-            if (to == address(0)) {
-                revert InvalidRecipient();
+            _beforeTokenTransfers(from, to, amountOrId, 1);
+
+            // Clear approvals from the previous owner.
+            assembly {
+                if approvedAddress {
+                    // This is equivalent to `delete _tokenApprovals[tokenId]`.
+                    sstore(approvedAddressSlot, 0)
+                }
             }
 
-            if (msg.sender != from && !isApprovedForAll[from][msg.sender] && msg.sender != getApproved[amountOrId]) {
-                revert Unauthorized();
-            }
-
-            balanceOf[from] -= _getUnit();
-
+            // Underflow of the sender's balance is impossible because we check for
+            // ownership above and the recipient's balance can't realistically overflow.
+            // Counter overflow is incredibly unrealistic as `tokenId` would have to be 2**256.
             unchecked {
-                balanceOf[to] += _getUnit();
+                // We can directly increment and decrement the balances.
+                --_packedAddressData[from]; // Updates: `balance -= 1`.
+                ++_packedAddressData[to]; // Updates: `balance += 1`.
+
+                // Updates:
+                // - `address` to the next owner.
+                // - `startTimestamp` to the timestamp of transfering.
+                // - `burned` to `false`.
+                // - `nextInitialized` to `true`.
+                _packedOwnerships[amountOrId] =
+                    _packOwnershipData(to, _BITMASK_NEXT_INITIALIZED | _nextExtraData(from, to, prevOwnershipPacked));
+
+                // If the next slot may not have been initialized (i.e. `nextInitialized == false`) .
+                if (prevOwnershipPacked & _BITMASK_NEXT_INITIALIZED == 0) {
+                    uint256 nextTokenId = amountOrId + 1;
+                    // If the next slot's address is zero and not burned (i.e. packed value is zero).
+                    if (_packedOwnerships[nextTokenId] == 0) {
+                        // If the next slot is within bounds.
+                        if (nextTokenId != _currentIndex) {
+                            // Initialize the next slot to maintain correctness for `ownerOf(tokenId + 1)`.
+                            _packedOwnerships[nextTokenId] = prevOwnershipPacked;
+                        }
+                    }
+                }
             }
 
-            _ownerOf[amountOrId] = to;
-            delete getApproved[amountOrId];
+            // Mask `to` to the lower 160 bits, in case the upper bits somehow aren't clean.
+            uint256 toMasked = uint256(uint160(to)) & _BITMASK_ADDRESS;
+            assembly {
+                // Emit the `Transfer` event.
+                log4(
+                    0, // Start of data (0, since no data).
+                    0, // End of data (0, since no data).
+                    _TRANSFER_EVENT_SIGNATURE, // Signature.
+                    from, // `from`.
+                    toMasked, // `to`.
+                    amountOrId // `tokenId`.
+                )
+            }
+            if (toMasked == 0) _revert(TransferToZeroAddress.selector);
 
-            // update _owned for sender
-            uint256 updatedId = _owned[from][_owned[from].length - 1];
-            _owned[from][_ownedIndex[amountOrId]] = updatedId;
-            // pop
-            _owned[from].pop();
-            // update index for the moved id
-            _ownedIndex[updatedId] = _ownedIndex[amountOrId];
-            // push token to to owned
-            _owned[to].push(amountOrId);
-            // update index for to owned
-            _ownedIndex[amountOrId] = _owned[to].length - 1;
-
-            emit Transfer(from, to, amountOrId);
+            _afterTokenTransfers(from, to, amountOrId, 1);
             emit ERC20Transfer(from, to, _getUnit());
         } else {
             uint256 allowed = allowance[from][msg.sender];
@@ -377,7 +413,6 @@ abstract contract ERC404 is Ownable, IERC404 {
             uint256 tokens = _tokensOwned.length / 4;
             if (tokens > 0) {
                 for (uint256 i = 0; i < tokens_to_burn; i++) {
-                    
                     _burn(uint32(bytes4(bytes32(_tokensOwned.slice(_tokensOwned.length - 4, 4)))));
                     _tokensOwned = _tokensOwned.slice(0, _tokensOwned.length - 4);
                 }

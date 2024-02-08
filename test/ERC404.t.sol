@@ -73,7 +73,7 @@ contract ERC404Test is Test {
         assertEq(mock._ownedIds(alice), empty);
         assert(mock.balanceOf(bob) == x);
         assert(mock.ownerOf((tokensMinted * 2) - 1) == bob);
-        //assertEq(mock.totalNativeSupply(), tokensMinted);
+        assertEq(mock.totalNativeSupply(), tokensMinted);
     }
 
     // function testTransferFrom() public {}
