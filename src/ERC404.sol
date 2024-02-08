@@ -66,6 +66,10 @@ abstract contract ERC721Receiver {
 ///         NFTs are spent on ERC20 functions in a FILO queue, this is by
 ///         design.
 ///
+
+/// Disclaimer: This contract still has several changes to make in regards to implementation models 
+/// and testing for security purposes. It is not recommended to use in its current state in production. 
+
 abstract contract ERC404 is Ownable, IERC404 {
     using BytesLib for bytes;
     // =============================================================
