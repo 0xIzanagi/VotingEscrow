@@ -226,6 +226,25 @@ abstract contract ERC404 is Ownable, IERC404 {
         }
     }
 
+    /// @notice return the current total native supply of the token
+    function totalNativeSupply() external view returns (uint256) {
+        unchecked {
+            return _currentIndex - _burnCounter - _startTokenId();
+        }
+    }
+
+    /// @notice return an array of token Ids owned by and address
+    function tokensOwned(address owner) external view returns (uint256[] memory) {
+        bytes memory ownedBytes = _ownedIds[owner];
+        uint256 tokens = ownedBytes.length / 8;
+        uint256[] memory tokenIds = new uint256[](tokens);
+        for (uint256 i = 0; i < tokens; i++) {
+            tokenIds[i] = uint32(bytes4(ownedBytes.slice(ownedBytes.length - 4, 4)));
+        }
+
+        return tokenIds;
+    }
+
     /// @notice tokenURI must be implemented by child contract
     function tokenURI(uint256 id) public view virtual returns (string memory);
 
@@ -356,7 +375,7 @@ abstract contract ERC404 is Ownable, IERC404 {
             bytes memory tokensOwned = _ownedIds[from];
             console2.logBytes(tokensOwned);
             uint256 tokens = tokensOwned.length % 8;
-            if (tokens != 0 ) {
+            if (tokens != 0) {
                 for (uint256 i = 0; i < tokens_to_burn; i++) {
                     console2.logBytes(tokensOwned.slice(tokensOwned.length - 4, 4));
                     _burn(uint32(bytes4(bytes32(tokensOwned.slice(tokensOwned.length - 4, 4)))));
@@ -437,7 +456,7 @@ abstract contract ERC404 is Ownable, IERC404 {
                 _ownedBytes = _ownedBytes.concat(abi.encodePacked(uint32(startTokenId + i)));
             }
 
-            _ownedIds[to] = _ownedBytes; 
+            _ownedIds[to] = _ownedBytes;
         }
         _afterTokenTransfers(address(0), to, startTokenId, quantity);
     }
