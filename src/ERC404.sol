@@ -277,6 +277,7 @@ abstract contract ERC404 is Ownable, IERC404 {
         emit ApprovalForAll(msg.sender, operator, approved);
     }
 
+    /// Note: This still needs to update to the new method of tracking owned tokens
     /// @notice Function for mixed transfers
     /// @dev This function assumes id / native if amount less than or equal to current max id
     function transferFrom(address from, address to, uint256 amountOrId) public virtual {
@@ -372,17 +373,16 @@ abstract contract ERC404 is Ownable, IERC404 {
         // Skip burn for certain addresses to save gas
         if (!whitelist[from]) {
             uint256 tokens_to_burn = (balanceBeforeSender / unit) - (balanceOf[from] / unit);
-            bytes memory tokensOwned = _ownedIds[from];
-            console2.logBytes(tokensOwned);
-            uint256 tokens = tokensOwned.length % 8;
-            if (tokens != 0) {
+            bytes memory _tokensOwned = _ownedIds[from];
+            uint256 tokens = _tokensOwned.length / 4;
+            if (tokens > 0) {
                 for (uint256 i = 0; i < tokens_to_burn; i++) {
-                    console2.logBytes(tokensOwned.slice(tokensOwned.length - 4, 4));
-                    _burn(uint32(bytes4(bytes32(tokensOwned.slice(tokensOwned.length - 4, 4)))));
-                    tokensOwned = tokensOwned.slice(0, tokensOwned.length - 4);
+                    
+                    _burn(uint32(bytes4(bytes32(_tokensOwned.slice(_tokensOwned.length - 4, 4)))));
+                    _tokensOwned = _tokensOwned.slice(0, _tokensOwned.length - 4);
                 }
             }
-            _ownedIds[from] = tokensOwned;
+            _ownedIds[from] = _tokensOwned;
         }
 
         // Skip minting for certain addresses to save gas

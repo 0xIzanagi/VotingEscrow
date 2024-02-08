@@ -57,23 +57,23 @@ contract ERC404Test is Test {
     /// @dev transfer test for fractional reserves
     function testTransfer(uint256 x) public {
         vm.assume(x > 1 ether && x < 1_000 ether);
-        console2.logBytes(mock._ownedIds(alice));
         mock.transfer(alice, x);
         uint256 tokensMinted = x / 1 ether;
-        console2.logBytes(mock._ownedIds(alice));
 
-        // /// @dev can be more thorough on this assertion, but requires additional time through loops
-        // assert(mock.ownerOf(tokensMinted - 1) == alice);
+        /// @dev can be more thorough on this assertion, but requires additional time through loops
+        assert(mock.ownerOf(tokensMinted - 1) == alice);
 
-        // assert(mock.balanceOf(address(this)) == (10_000 ether - x));
-        // assert(mock.balanceOf(alice) == x);
+        assert(mock.balanceOf(address(this)) == (10_000 ether - x));
+        assert(mock.balanceOf(alice) == x);
 
         vm.prank(alice);
         mock.transfer(bob, x);
-
-        // assert(mock.balanceOf(alice) == 0);
-        // assert(mock.balanceOf(bob) == x);
-        // assert(mock.ownerOf((tokensMinted * 2) - 1) == bob);
+        bytes memory empty;
+        assert(mock.balanceOf(alice) == 0);
+        assertEq(mock._ownedIds(alice), empty);
+        assert(mock.balanceOf(bob) == x);
+        assert(mock.ownerOf((tokensMinted * 2) - 1) == bob);
+        //assertEq(mock.totalNativeSupply(), tokensMinted);
     }
 
     // function testTransferFrom() public {}
