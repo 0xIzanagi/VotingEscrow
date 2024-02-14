@@ -1,819 +1,697 @@
-//SPDX-License-Identifier: UNLICENSED
+//SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 import {IERC404} from "./interfaces/IERC404.sol";
-import {BytesLib} from "./utils/BytesLib.sol";
-import {console2} from "lib/forge-std/src/console2.sol";
+import {ERC721Receiver} from "./libraries/ERC721Receiver.sol";
+import {DoubleEndedQueue} from "./libraries/DoubleEndedQueue.sol";
+import {IERC165} from "./interfaces/IERC165.sol";
 
-abstract contract Ownable {
-    event OwnershipTransferred(address indexed user, address indexed newOwner);
+abstract contract ERC404 is IERC404 {
+  using DoubleEndedQueue for DoubleEndedQueue.Uint256Deque;
 
-    error Unauthorized();
-    error InvalidOwner();
+  /// @dev The queue of ERC-721 tokens stored in the contract.
+  DoubleEndedQueue.Uint256Deque private _storedERC721Ids;
 
-    address public owner;
+  /// @dev Token name
+  string public name;
 
-    modifier onlyOwner() virtual {
-        if (msg.sender != owner) revert Unauthorized();
+  /// @dev Token symbol
+  string public symbol;
 
-        _;
+  /// @dev Decimals for ERC-20 representation
+  uint8 public immutable decimals;
+
+  /// @dev Units for ERC-20 representation
+  uint256 public immutable units;
+
+  /// @dev Total supply in ERC-20 representation
+  uint256 public totalSupply;
+
+  /// @dev Current mint counter which also represents the highest
+  ///      minted id, monotonically increasing to ensure accurate ownership
+  uint256 internal _minted;
+
+  /// @dev Initial chain id for EIP-2612 support
+  uint256 internal immutable INITIAL_CHAIN_ID;
+
+  /// @dev Initial domain separator for EIP-2612 support
+  bytes32 internal immutable INITIAL_DOMAIN_SEPARATOR;
+
+  /// @dev Balance of user in ERC-20 representation
+  mapping(address => uint256) public balanceOf;
+
+  /// @dev Allowance of user in ERC-20 representation
+  mapping(address => mapping(address => uint256)) public allowance;
+
+  /// @dev Approval in ERC-721 representaion
+  mapping(uint256 => address) public getApproved;
+
+  /// @dev Approval for all in ERC-721 representation
+  mapping(address => mapping(address => bool)) public isApprovedForAll;
+
+  /// @dev Packed representation of ownerOf and owned indices
+  mapping(uint256 => uint256) internal _ownedData;
+
+  /// @dev Array of owned ids in ERC-721 representation
+  mapping(address => uint256[]) internal _owned;
+
+  /// @dev Addresses that are exempt from ERC-721 transfer, typically for gas savings (pairs, routers, etc)
+  mapping(address => bool) public erc721TransferExempt;
+
+  /// @dev EIP-2612 nonces
+  mapping(address => uint256) public nonces;
+
+  /// @dev Address bitmask for packed ownership data
+  uint256 private constant _BITMASK_ADDRESS = (1 << 160) - 1;
+
+  /// @dev Owned index bitmask for packed ownership data
+  uint256 private constant _BITMASK_OWNED_INDEX = ((1 << 96) - 1) << 160;
+
+  constructor(string memory name_, string memory symbol_, uint8 decimals_) {
+    name = name_;
+    symbol = symbol_;
+
+    if (decimals_ < 18) {
+      revert DecimalsTooLow();
     }
 
-    constructor(address _owner) {
-        if (_owner == address(0)) revert InvalidOwner();
+    decimals = decimals_;
+    units = 10 ** decimals;
 
-        owner = _owner;
+    // EIP-2612 initialization
+    INITIAL_CHAIN_ID = block.chainid;
+    INITIAL_DOMAIN_SEPARATOR = _computeDomainSeparator();
+  }
 
-        emit OwnershipTransferred(address(0), _owner);
+  /// @notice Function to find owner of a given ERC-721 token
+  function ownerOf(
+    uint256 id_
+  ) public view virtual returns (address erc721Owner) {
+    erc721Owner = _getOwnerOf(id_);
+
+    // If the id_ is beyond the range of minted tokens, is 0, or the token is not owned by anyone, revert.
+    if (id_ > _minted || id_ == 0 || erc721Owner == address(0)) {
+      revert NotFound();
+    }
+  }
+
+  function owned(
+    address owner_
+  ) public view virtual returns (uint256[] memory) {
+    return _owned[owner_];
+  }
+
+  function erc721BalanceOf(
+    address owner_
+  ) public view virtual returns (uint256) {
+    return _owned[owner_].length;
+  }
+
+  function erc20BalanceOf(
+    address owner_
+  ) public view virtual returns (uint256) {
+    return balanceOf[owner_];
+  }
+
+  function erc20TotalSupply() public view virtual returns (uint256) {
+    return totalSupply;
+  }
+
+  function erc721TotalSupply() public view virtual returns (uint256) {
+    return _minted;
+  }
+
+  function erc721TokensBankedInQueue() public view virtual returns (uint256) {
+    return _storedERC721Ids.length();
+  }
+
+  /// @notice tokenURI must be implemented by child contract
+  function tokenURI(uint256 id_) public view virtual returns (string memory);
+
+  /// @notice Function for token approvals
+  /// @dev This function assumes the operator is attempting to approve an ERC-721
+  ///      if valueOrId is less than the minted count. Note: Unlike setApprovalForAll,
+  ///      spender_ must be allowed to be 0x0 so that approval can be revoked.
+  function approve(
+    address spender_,
+    uint256 valueOrId_
+  ) public virtual returns (bool) {
+    // The ERC-721 tokens are 1-indexed, so 0 is not a valid id and indicates that
+    // operator is attempting to set the ERC-20 allowance to 0.
+    if (valueOrId_ <= _minted && valueOrId_ > 0) {
+      // Intention is to approve as ERC-721 token (id).
+      uint256 id = valueOrId_;
+      address erc721Owner = _getOwnerOf(id);
+
+      if (
+        msg.sender != erc721Owner && !isApprovedForAll[erc721Owner][msg.sender]
+      ) {
+        revert Unauthorized();
+      }
+
+      getApproved[id] = spender_;
+
+      emit ERC721Approval(erc721Owner, spender_, id);
+    } else {
+      // Prevent granting 0x0 an ERC-20 allowance.
+      if (spender_ == address(0)) {
+        revert InvalidSpender();
+      }
+
+      // Intention is to approve as ERC-20 token (value).
+      uint256 value = valueOrId_;
+      allowance[msg.sender][spender_] = value;
+
+      emit ERC20Approval(msg.sender, spender_, value);
     }
 
-    function transferOwnership(address _owner) public virtual onlyOwner {
-        if (_owner == address(0)) revert InvalidOwner();
+    return true;
+  }
 
-        owner = _owner;
+  /// @notice Function for ERC-721 approvals
+  function setApprovalForAll(address operator_, bool approved_) public virtual {
+    // Prevent approvals to 0x0.
+    if (operator_ == address(0)) {
+      revert InvalidOperator();
+    }
+    isApprovedForAll[msg.sender][operator_] = approved_;
+    emit ApprovalForAll(msg.sender, operator_, approved_);
+  }
 
-        emit OwnershipTransferred(msg.sender, _owner);
+  /// @notice Function for mixed transfers from an operator that may be different than 'from'.
+  /// @dev This function assumes the operator is attempting to transfer an ERC-721
+  ///      if valueOrId is less than or equal to current max id.
+  function transferFrom(
+    address from_,
+    address to_,
+    uint256 valueOrId_
+  ) public virtual returns (bool) {
+    // Prevent transferring tokens from 0x0.
+    if (from_ == address(0)) {
+      revert InvalidSender();
     }
 
-    function revokeOwnership() public virtual onlyOwner {
-        owner = address(0);
-
-        emit OwnershipTransferred(msg.sender, address(0));
-    }
-}
-
-abstract contract ERC721Receiver {
-    function onERC721Received(address, address, uint256, bytes calldata) external virtual returns (bytes4) {
-        return ERC721Receiver.onERC721Received.selector;
-    }
-}
-
-/// @notice ERC404
-///         A gas-efficient, mixed ERC20 / ERC721 implementation
-///         with native liquidity and fractionalization.
-///
-///         This is an experimental standard designed to integrate
-///         with pre-existing ERC20 / ERC721 support as smoothly as
-///         possible.
-///         This version uses ERC721A mint functionality to dramatically
-///         reduce gas costs for larger transfers
-///
-/// @dev    In order to support full functionality of ERC20 and ERC721
-///         supply assumptions are made that slightly constraint usage.
-///         Ensure decimals are sufficiently large (standard 18 recommended)
-///         as ids are effectively encoded in the lowest range of amounts.
-///
-///         NFTs are spent on ERC20 functions in a FILO queue, this is by
-///         design.
-///
-
-/// Disclaimer: This contract still has several changes to make in regards to implementation models 
-/// and testing for security purposes. It is not recommended to use in its current state in production. 
-
-abstract contract ERC404 is Ownable, IERC404 {
-    using BytesLib for bytes;
-    // =============================================================
-    //                           CONSTANTS
-    // =============================================================
-
-    // Mask of an entry in packed address data.
-    uint256 private constant _BITMASK_ADDRESS_DATA_ENTRY = (1 << 64) - 1;
-
-    // The bit position of `numberMinted` in packed address data.
-    uint256 private constant _BITPOS_NUMBER_MINTED = 64;
-
-    // The bit position of `numberBurned` in packed address data.
-    uint256 private constant _BITPOS_NUMBER_BURNED = 128;
-
-    // The bit position of `aux` in packed address data.
-    uint256 private constant _BITPOS_AUX = 192;
-
-    // Mask of all 256 bits in packed address data except the 64 bits for `aux`.
-    uint256 private constant _BITMASK_AUX_COMPLEMENT = (1 << 192) - 1;
-
-    // The bit position of `startTimestamp` in packed ownership.
-    uint256 private constant _BITPOS_START_TIMESTAMP = 160;
-
-    // The bit mask of the `burned` bit in packed ownership.
-    uint256 private constant _BITMASK_BURNED = 1 << 224;
-
-    // The bit position of the `nextInitialized` bit in packed ownership.
-    uint256 private constant _BITPOS_NEXT_INITIALIZED = 225;
-
-    // The bit mask of the `nextInitialized` bit in packed ownership.
-    uint256 private constant _BITMASK_NEXT_INITIALIZED = 1 << 225;
-
-    // The bit position of `extraData` in packed ownership.
-    uint256 private constant _BITPOS_EXTRA_DATA = 232;
-
-    // Mask of all 256 bits in a packed ownership except the 24 bits for `extraData`.
-    uint256 private constant _BITMASK_EXTRA_DATA_COMPLEMENT = (1 << 232) - 1;
-
-    // The mask of the lower 160 bits for addresses.
-    uint256 private constant _BITMASK_ADDRESS = (1 << 160) - 1;
-
-    // The maximum `quantity` that can be minted with {_mintERC2309}.
-    // This limit is to prevent overflows on the address data entries.
-    // For a limit of 5000, a total of 3.689e15 calls to {_mintERC2309}
-    // is required to cause an overflow, which is unrealistic.
-    uint256 private constant _MAX_MINT_ERC2309_QUANTITY_LIMIT = 5000;
-
-    // The `Transfer` event signature is given by:
-    // `keccak256(bytes("Transfer(address,address,uint256)"))`.
-    bytes32 private constant _TRANSFER_EVENT_SIGNATURE =
-        0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef;
-
-    // =============================================================
-    //                            STORAGE
-    // =============================================================
-
-    // The next token ID to be minted.
-    uint256 private _currentIndex;
-
-    // The number of tokens burned.
-    uint256 private _burnCounter;
-
-    // Metadata
-    /// @dev Token name
-    string public name;
-
-    /// @dev Token symbol
-    string public symbol;
-
-    /// @dev Decimals for fractional representation
-    uint8 public immutable decimals;
-
-    /// @dev Total supply in fractionalized representation
-    uint256 public immutable totalSupply;
-
-    /// @dev Current mint counter, monotonically increasing to ensure accurate ownership
-    uint256 public minted;
-
-    // Mappings
-    /// @dev Balance of user in fractional representation
-    mapping(address => uint256) public balanceOf;
-
-    /// @dev Allowance of user in fractional representation
-    mapping(address => mapping(address => uint256)) public allowance;
-
-    /// @dev Approval in native representaion
-    mapping(uint256 => address) public getApproved;
-
-    /// @dev Approval for all in native representation
-    mapping(address => mapping(address => bool)) public isApprovedForAll;
-
-    /// @dev Owner of id in native representation
-    mapping(uint256 => address) internal _ownerOf;
-
-    /// @dev Array of owned ids in native representation
-    mapping(address => uint256[]) internal _owned;
-
-    /// @dev bytes array to keep track of token ids owned by a user
-    /// token ids are stored in 4 byte chuncks and are safe until id's over 4 billion.
-    /// If needed this can be expanded on more gas efficent chains than mainnet ethereum.
-    mapping(address => bytes) public _ownedIds;
-
-    /// @dev Tracks indices for the _owned mapping
-    mapping(uint256 => uint256) internal _ownedIndex;
-
-    /// @dev Addresses whitelisted from minting / burning for gas savings (pairs, routers, etc)
-    mapping(address => bool) public whitelist;
-
-    // Mapping from token ID to ownership details
-    // An empty struct value does not necessarily mean the token is unowned.
-    // See {_packedOwnershipOf} implementation for details.
-    //
-    // Bits Layout:
-    // - [0..159]   `addr`
-    // - [160..223] `startTimestamp`
-    // - [224]      `burned`
-    // - [225]      `nextInitialized`
-    // - [232..255] `extraData`
-    mapping(uint256 => uint256) private _packedOwnerships;
-
-    // Mapping owner address to address data.
-    //
-    // Bits Layout:
-    // - [0..63]    `balance`
-    // - [64..127]  `numberMinted`
-    // - [128..191] `numberBurned`
-    // - [192..255] `aux`
-    mapping(address => uint256) private _packedAddressData;
-
-    // Mapping from token ID to approved address.
-    mapping(uint256 => TokenApprovalRef) private _tokenApprovals;
-
-    // Mapping from owner to operator approvals
-    mapping(address => mapping(address => bool)) private _operatorApprovals;
-
-    // Constructor
-    constructor(string memory _name, string memory _symbol, uint8 _decimals, uint256 _totalNativeSupply, address _owner)
-        Ownable(_owner)
-    {
-        name = _name;
-        symbol = _symbol;
-        decimals = _decimals;
-        totalSupply = _totalNativeSupply * (10 ** decimals);
+    // Prevent burning tokens to 0x0.
+    if (to_ == address(0)) {
+      revert InvalidRecipient();
     }
 
-    /// @notice Initialization function to set pairs / etc
-    ///         saving gas by avoiding mint / burn on unnecessary targets
-    function setWhitelist(address target, bool state) public onlyOwner {
-        whitelist[target] = state;
+    if (valueOrId_ <= _minted) {
+      // Intention is to transfer as ERC-721 token (id).
+      uint256 id = valueOrId_;
+
+      if (from_ != _getOwnerOf(id)) {
+        revert Unauthorized();
+      }
+
+      // Check that the operator is either the sender or approved for the transfer.
+      if (
+        msg.sender != from_ &&
+        !isApprovedForAll[from_][msg.sender] &&
+        msg.sender != getApproved[id]
+      ) {
+        revert Unauthorized();
+      }
+
+      // Neither the sender nor the recipient can be ERC-721 transfer exempt when transferring specific token ids.
+      if (erc721TransferExempt[from_]) {
+        revert SenderIsERC721TransferExempt();
+      }
+
+      if (erc721TransferExempt[to_]) {
+        revert RecipientIsERC721TransferExempt();
+      }
+
+      // Transfer 1 * units ERC-20 and 1 ERC-721 token.
+      // ERC-721 transfer exemptions handled above. Can't make it to this point if either is transfer exempt.
+      _transferERC20(from_, to_, units);
+      _transferERC721(from_, to_, id);
+    } else {
+      // Intention is to transfer as ERC-20 token (value).
+      uint256 value = valueOrId_;
+      uint256 allowed = allowance[from_][msg.sender];
+
+      // Check that the operator has sufficient allowance.
+      if (allowed != type(uint256).max) {
+        allowance[from_][msg.sender] = allowed - value;
+      }
+
+      // Transferring ERC-20s directly requires the _transfer function.
+      // Handles ERC-721 exemptions internally.
+      _transferERC20WithERC721(from_, to_, value);
     }
 
-    /// @notice Function to find owner of a given native token
-    /// @dev returns address(0) if burned but does not change anything for checks on new mints
-    function ownerOf(uint256 tokenId) public view virtual override returns (address) {
-        TokenOwnership memory ownership = _ownershipOf(tokenId);
-        if (!ownership.burned) {
-            return ownership.addr;
-        } else {
-            return address(0);
-        }
+    return true;
+  }
+
+  /// @notice Function for ERC-20 transfers.
+  /// @dev This function assumes the operator is attempting to transfer as ERC-20
+  ///      given this function is only supported on the ERC-20 interface. 
+  ///      Treats even small amounts that are valid ERC-721 ids as ERC-20s.
+  function transfer(address to_, uint256 value_) public virtual returns (bool) {
+    // Prevent burning tokens to 0x0.
+    if (to_ == address(0)) {
+      revert InvalidRecipient();
     }
 
-    /// @notice return the current total native supply of the token
-    function totalNativeSupply() external view returns (uint256) {
+    // Transferring ERC-20s directly requires the _transfer function.
+    // Handles ERC-721 exemptions internally.
+    return _transferERC20WithERC721(msg.sender, to_, value_);
+  }
+
+  /// @notice Function for ERC-721 transfers with contract support.
+  /// This function only supports moving valid ERC-721 ids, as it does not exist on the ERC-20 spec and will revert otherwise.
+  function safeTransferFrom(
+    address from_,
+    address to_,
+    uint256 id_
+  ) public virtual {
+    safeTransferFrom(from_, to_, id_, "");
+  }
+
+  /// @notice Function for ERC-721 transfers with contract support and callback data.
+  /// This function only supports moving valid ERC-721 ids, as it does not exist on the ERC-20 spec and will revert otherwise.
+  function safeTransferFrom(
+    address from_,
+    address to_,
+    uint256 id_,
+    bytes memory data_
+  ) public virtual {
+    if (id_ > _minted || id_ == 0) {
+      revert InvalidId();
+    }
+
+    transferFrom(from_, to_, id_);
+
+    if (
+      to_.code.length != 0 &&
+      ERC721Receiver(to_).onERC721Received(msg.sender, from_, id_, data_) !=
+      ERC721Receiver.onERC721Received.selector
+    ) {
+      revert UnsafeRecipient();
+    }
+  }
+
+  /// @notice Function for EIP-2612 permits
+  function permit(
+    address owner_,
+    address spender_,
+    uint256 value_,
+    uint256 deadline_,
+    uint8 v_,
+    bytes32 r_,
+    bytes32 s_
+  ) public virtual {
+    if (deadline_ < block.timestamp) {
+      revert PermitDeadlineExpired();
+    }
+
+    if (value_ <= _minted && value_ > 0) {
+      revert InvalidApproval();
+    }
+
+    if (spender_ == address(0)) {
+      revert InvalidSpender();
+    }
+
+    unchecked {
+      address recoveredAddress = ecrecover(
+        keccak256(
+          abi.encodePacked(
+            "\x19\x01",
+            DOMAIN_SEPARATOR(),
+            keccak256(
+              abi.encode(
+                keccak256(
+                  "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
+                ),
+                owner_,
+                spender_,
+                value_,
+                nonces[owner_]++,
+                deadline_
+              )
+            )
+          )
+        ),
+        v_,
+        r_,
+        s_
+      );
+
+      if (recoveredAddress == address(0) || recoveredAddress != owner_) {
+        revert InvalidSigner();
+      }
+
+      allowance[recoveredAddress][spender_] = value_;
+    }
+
+    emit ERC20Approval(owner_, spender_, value_);
+  }
+
+  /// @notice Returns domain initial domain separator, or recomputes if chain id is not equal to initial chain id
+  function DOMAIN_SEPARATOR() public view virtual returns (bytes32) {
+    return
+      block.chainid == INITIAL_CHAIN_ID
+        ? INITIAL_DOMAIN_SEPARATOR
+        : _computeDomainSeparator();
+  }
+
+  function supportsInterface(
+    bytes4 interfaceId
+  ) public view virtual returns (bool) {
+    return
+      interfaceId == type(IERC404).interfaceId ||
+      interfaceId == type(IERC165).interfaceId;
+  }
+
+  /// @notice Internal function to compute domain separator for EIP-2612 permits
+  function _computeDomainSeparator() internal view virtual returns (bytes32) {
+    return
+      keccak256(
+        abi.encode(
+          keccak256(
+            "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+          ),
+          keccak256(bytes(name)),
+          keccak256("1"),
+          block.chainid,
+          address(this)
+        )
+      );
+  }
+
+  /// @notice This is the lowest level ERC-20 transfer function, which
+  ///         should be used for both normal ERC-20 transfers as well as minting.
+  /// Note that this function allows transfers to and from 0x0.
+  function _transferERC20(
+    address from_,
+    address to_,
+    uint256 value_
+  ) internal virtual {
+    // Minting is a special case for which we should not check the balance of
+    // the sender, and we should increase the total supply.
+    if (from_ == address(0)) {
+      totalSupply += value_;
+    } else {
+      // Deduct value from sender's balance.
+      balanceOf[from_] -= value_;
+    }
+
+    // Update the recipient's balance.
+    // Can be unchecked because on mint, adding to totalSupply is checked, and on transfer balance deduction is checked.
+    unchecked {
+      balanceOf[to_] += value_;
+    }
+
+    emit ERC20Transfer(from_, to_, value_);
+  }
+
+  /// @notice Consolidated record keeping function for transferring ERC-721s.
+  /// @dev Assign the token to the new owner, and remove from the old owner.
+  /// Note that this function allows transfers to and from 0x0.
+  /// Does not handle ERC-721 exemptions.
+  function _transferERC721(
+    address from_,
+    address to_,
+    uint256 id_
+  ) internal virtual {
+    // If this is not a mint, handle record keeping for transfer from previous owner.
+    if (from_ != address(0)) {
+      // On transfer of an NFT, any previous approval is reset.
+      delete getApproved[id_];
+
+      uint256 updatedId = _owned[from_][_owned[from_].length - 1];
+      if (updatedId != id_) {
+        uint256 updatedIndex = _getOwnedIndex(id_);
+        // update _owned for sender
+        _owned[from_][updatedIndex] = updatedId;
+        // update index for the moved id
+        _setOwnedIndex(updatedId, updatedIndex);
+      }
+
+      // pop
+      _owned[from_].pop();
+    }
+
+    // Check if this is a burn.
+    if (to_ != address(0)) {
+      // If not a burn, update the owner of the token to the new owner.
+      // Update owner of the token to the new owner.
+      _setOwnerOf(id_, to_);
+      // Push token onto the new owner's stack.
+      _owned[to_].push(id_);
+      // Update index for new owner's stack.
+      _setOwnedIndex(id_, _owned[to_].length - 1);
+    } else {
+      // If this is a burn, reset the owner of the token to 0x0 by deleting the token from _ownedData.
+      delete _ownedData[id_];
+    }
+
+    emit ERC721Transfer(from_, to_, id_);
+  }
+
+  /// @notice Internal function for ERC-20 transfers. Also handles any ERC-721 transfers that may be required.
+  // Handles ERC-721 exemptions.
+  function _transferERC20WithERC721(
+    address from_,
+    address to_,
+    uint256 value_
+  ) internal virtual returns (bool) {
+    uint256 erc20BalanceOfSenderBefore = erc20BalanceOf(from_);
+    uint256 erc20BalanceOfReceiverBefore = erc20BalanceOf(to_);
+
+    _transferERC20(from_, to_, value_);
+
+    // Preload for gas savings on branches
+    bool isFromERC721TransferExempt = erc721TransferExempt[from_];
+    bool isToERC721TransferExempt = erc721TransferExempt[to_];
+
+    // Skip _withdrawAndStoreERC721 and/or _retrieveOrMintERC721 for ERC-721 transfer exempt addresses
+    // 1) to save gas
+    // 2) because ERC-721 transfer exempt addresses won't always have/need ERC-721s corresponding to their ERC20s.
+    if (isFromERC721TransferExempt && isToERC721TransferExempt) {
+      // Case 1) Both sender and recipient are ERC-721 transfer exempt. No ERC-721s need to be transferred.
+      // NOOP.
+    } else if (isFromERC721TransferExempt) {
+      // Case 2) The sender is ERC-721 transfer exempt, but the recipient is not. Contract should not attempt
+      //         to transfer ERC-721s from the sender, but the recipient should receive ERC-721s
+      //         from the bank/minted for any whole number increase in their balance.
+      // Only cares about whole number increments.
+      uint256 tokensToRetrieveOrMint = (balanceOf[to_] / units) -
+        (erc20BalanceOfReceiverBefore / units);
+      for (uint256 i = 0; i < tokensToRetrieveOrMint;) {
+        _retrieveOrMintERC721(to_);
         unchecked {
-            return _currentIndex - _burnCounter - _startTokenId();
+          i++;
         }
-    }
-
-    /// @notice return an array of token Ids owned by and address
-    function tokensOwned(address owner) external view returns (uint256[] memory) {
-        bytes memory ownedBytes = _ownedIds[owner];
-        uint256 tokens = ownedBytes.length / 8;
-        uint256[] memory tokenIds = new uint256[](tokens);
-        for (uint256 i = 0; i < tokens; i++) {
-            tokenIds[i] = uint32(bytes4(ownedBytes.slice(ownedBytes.length - 4, 4)));
-        }
-
-        return tokenIds;
-    }
-
-    /// @notice tokenURI must be implemented by child contract
-    function tokenURI(uint256 id) public view virtual returns (string memory);
-
-    /// @notice Function for token approvals
-    /// @dev This function assumes id / native if amount less than or equal to current max id
-    function approve(address spender, uint256 amountOrId) public virtual returns (bool) {
-        if (amountOrId <= minted && amountOrId > 0) {
-            address owner = _ownerOf[amountOrId];
-
-            if (msg.sender != owner && !isApprovedForAll[owner][msg.sender]) {
-                revert Unauthorized();
-            }
-
-            getApproved[amountOrId] = spender;
-
-            emit Approval(owner, spender, amountOrId);
-        } else {
-            allowance[msg.sender][spender] = amountOrId;
-
-            emit Approval(msg.sender, spender, amountOrId);
-        }
-
-        return true;
-    }
-
-    /// @notice Function native approvals
-    function setApprovalForAll(address operator, bool approved) public virtual {
-        isApprovedForAll[msg.sender][operator] = approved;
-
-        emit ApprovalForAll(msg.sender, operator, approved);
-    }
-
-    /// Note: This still needs to update to the new method of tracking owned tokens
-    /// @notice Function for mixed transfers
-    /// @dev This function assumes id / native if amount less than or equal to current max id
-    function transferFrom(address from, address to, uint256 amountOrId) public virtual {
-        if (amountOrId <= minted) {
-            uint256 prevOwnershipPacked = _packedOwnershipOf(amountOrId);
-
-            // Mask `from` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            from = address(uint160(uint256(uint160(from)) & _BITMASK_ADDRESS));
-
-            if (address(uint160(prevOwnershipPacked)) != from) _revert(TransferFromIncorrectOwner.selector);
-
-            (uint256 approvedAddressSlot, address approvedAddress) = _getApprovedSlotAndAddress(amountOrId);
-
-            // The nested ifs save around 20+ gas over a compound boolean condition.
-            if (!_isSenderApprovedOrOwner(approvedAddress, from, _msgSenderERC721A())) {
-                if (!isApprovedForAll[from][_msgSenderERC721A()]) _revert(TransferCallerNotOwnerNorApproved.selector);
-            }
-
-            _beforeTokenTransfers(from, to, amountOrId, 1);
-
-            // Clear approvals from the previous owner.
-            assembly {
-                if approvedAddress {
-                    // This is equivalent to `delete _tokenApprovals[tokenId]`.
-                    sstore(approvedAddressSlot, 0)
-                }
-            }
-
-            // Underflow of the sender's balance is impossible because we check for
-            // ownership above and the recipient's balance can't realistically overflow.
-            // Counter overflow is incredibly unrealistic as `tokenId` would have to be 2**256.
-            unchecked {
-                // We can directly increment and decrement the balances.
-                --_packedAddressData[from]; // Updates: `balance -= 1`.
-                ++_packedAddressData[to]; // Updates: `balance += 1`.
-
-                // Updates:
-                // - `address` to the next owner.
-                // - `startTimestamp` to the timestamp of transfering.
-                // - `burned` to `false`.
-                // - `nextInitialized` to `true`.
-                _packedOwnerships[amountOrId] =
-                    _packOwnershipData(to, _BITMASK_NEXT_INITIALIZED | _nextExtraData(from, to, prevOwnershipPacked));
-
-                // If the next slot may not have been initialized (i.e. `nextInitialized == false`) .
-                if (prevOwnershipPacked & _BITMASK_NEXT_INITIALIZED == 0) {
-                    uint256 nextTokenId = amountOrId + 1;
-                    // If the next slot's address is zero and not burned (i.e. packed value is zero).
-                    if (_packedOwnerships[nextTokenId] == 0) {
-                        // If the next slot is within bounds.
-                        if (nextTokenId != _currentIndex) {
-                            // Initialize the next slot to maintain correctness for `ownerOf(tokenId + 1)`.
-                            _packedOwnerships[nextTokenId] = prevOwnershipPacked;
-                        }
-                    }
-                }
-            }
-
-            // Mask `to` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            uint256 toMasked = uint256(uint160(to)) & _BITMASK_ADDRESS;
-            assembly {
-                // Emit the `Transfer` event.
-                log4(
-                    0, // Start of data (0, since no data).
-                    0, // End of data (0, since no data).
-                    _TRANSFER_EVENT_SIGNATURE, // Signature.
-                    from, // `from`.
-                    toMasked, // `to`.
-                    amountOrId // `tokenId`.
-                )
-            }
-            if (toMasked == 0) _revert(TransferToZeroAddress.selector);
-
-            _afterTokenTransfers(from, to, amountOrId, 1);
-            emit ERC20Transfer(from, to, _getUnit());
-        } else {
-            uint256 allowed = allowance[from][msg.sender];
-
-            if (allowed != type(uint256).max) {
-                allowance[from][msg.sender] = allowed - amountOrId;
-            }
-
-            _transfer(from, to, amountOrId);
-        }
-    }
-
-    /// @notice Function for fractional transfers
-    function transfer(address to, uint256 amount) public virtual returns (bool) {
-        return _transfer(msg.sender, to, amount);
-    }
-
-    /// @notice Function for native transfers with contract support
-    function safeTransferFrom(address from, address to, uint256 id) public virtual {
-        transferFrom(from, to, id);
-
-        if (
-            to.code.length != 0
-                && ERC721Receiver(to).onERC721Received(msg.sender, from, id, "") != ERC721Receiver.onERC721Received.selector
-        ) {
-            revert UnsafeRecipient();
-        }
-    }
-
-    /// @notice Function for native transfers with contract support and callback data
-    function safeTransferFrom(address from, address to, uint256 id, bytes calldata data) public virtual {
-        transferFrom(from, to, id);
-
-        if (
-            to.code.length != 0
-                && ERC721Receiver(to).onERC721Received(msg.sender, from, id, data)
-                    != ERC721Receiver.onERC721Received.selector
-        ) {
-            revert UnsafeRecipient();
-        }
-    }
-
-    /// @notice Internal function for fractional transfers
-    function _transfer(address from, address to, uint256 amount) internal returns (bool) {
-        uint256 unit = _getUnit();
-        uint256 balanceBeforeSender = balanceOf[from];
-        uint256 balanceBeforeReceiver = balanceOf[to];
-
-        balanceOf[from] -= amount;
-
+      }
+    } else if (isToERC721TransferExempt) {
+      // Case 3) The sender is not ERC-721 transfer exempt, but the recipient is. Contract should attempt
+      //         to withdraw and store ERC-721s from the sender, but the recipient should not
+      //         receive ERC-721s from the bank/minted.
+      // Only cares about whole number increments.
+      uint256 tokensToWithdrawAndStore = (erc20BalanceOfSenderBefore / units) -
+        (balanceOf[from_] / units);
+      for (uint256 i = 0; i < tokensToWithdrawAndStore;) {
+        _withdrawAndStoreERC721(from_);
         unchecked {
-            balanceOf[to] += amount;
+          i++;
         }
+      }
+    } else {
+      // Case 4) Neither the sender nor the recipient are ERC-721 transfer exempt.
+      // Strategy:
+      // 1. First deal with the whole tokens. These are easy and will just be transferred.
+      // 2. Look at the fractional part of the value:
+      //   a) If it causes the sender to lose a whole token that was represented by an NFT due to a
+      //      fractional part being transferred, withdraw and store an additional NFT from the sender.
+      //   b) If it causes the receiver to gain a whole new token that should be represented by an NFT
+      //      due to receiving a fractional part that completes a whole token, retrieve or mint an NFT to the recevier.
 
-        // Skip burn for certain addresses to save gas
-        if (!whitelist[from]) {
-            uint256 tokens_to_burn = (balanceBeforeSender / unit) - (balanceOf[from] / unit);
-            bytes memory _tokensOwned = _ownedIds[from];
-            uint256 tokens = _tokensOwned.length / 4;
-            if (tokens > 0) {
-                for (uint256 i = 0; i < tokens_to_burn; i++) {
-                    _burn(uint32(bytes4(bytes32(_tokensOwned.slice(_tokensOwned.length - 4, 4)))));
-                    _tokensOwned = _tokensOwned.slice(0, _tokensOwned.length - 4);
-                }
-            }
-            _ownedIds[from] = _tokensOwned;
-        }
-
-        // Skip minting for certain addresses to save gas
-        if (!whitelist[to]) {
-            uint256 tokens_to_mint = (balanceOf[to] / unit) - (balanceBeforeReceiver / unit);
-            _mint(to, tokens_to_mint);
-        }
-
-        emit ERC20Transfer(from, to, amount);
-        return true;
-    }
-
-    // Internal utility logic
-    function _getUnit() internal view returns (uint256) {
-        return 10 ** decimals;
-    }
-
-    function _mint(address to, uint256 quantity) internal virtual {
-        uint256 startTokenId = _currentIndex;
-        if (quantity == 0) _revert(MintZeroQuantity.selector);
-
-        _beforeTokenTransfers(address(0), to, startTokenId, quantity);
-
-        // Overflows are incredibly unrealistic.
-        // `balance` and `numberMinted` have a maximum limit of 2**64.
-        // `tokenId` has a maximum limit of 2**256.
+      // Whole tokens worth of ERC-20s get transferred as ERC-721s without any burning/minting.
+      uint256 nftsToTransfer = value_ / units;
+      for (uint256 i = 0; i < nftsToTransfer;) {
+        // Pop from sender's ERC-721 stack and transfer them (LIFO)
+        uint256 indexOfLastToken = _owned[from_].length - 1;
+        uint256 tokenId = _owned[from_][indexOfLastToken];
+        _transferERC721(from_, to_, tokenId);
         unchecked {
-            // Updates:
-            // - `address` to the owner.
-            // - `startTimestamp` to the timestamp of minting.
-            // - `burned` to `false`.
-            // - `nextInitialized` to `quantity == 1`.
-            _packedOwnerships[startTokenId] =
-                _packOwnershipData(to, _nextInitializedFlag(quantity) | _nextExtraData(address(0), to, 0));
-
-            // Updates:
-            // - `balance += quantity`.
-            // - `numberMinted += quantity`.
-            //
-            // We can directly add to the `balance` and `numberMinted`.
-            _packedAddressData[to] += quantity * ((1 << _BITPOS_NUMBER_MINTED) | 1);
-
-            // Mask `to` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            uint256 toMasked = uint256(uint160(to)) & _BITMASK_ADDRESS;
-
-            if (toMasked == 0) _revert(MintToZeroAddress.selector);
-
-            uint256 end = startTokenId + quantity;
-            uint256 tokenId = startTokenId;
-
-            do {
-                assembly {
-                    // Emit the `Transfer` event.
-                    log4(
-                        0, // Start of data (0, since no data).
-                        0, // End of data (0, since no data).
-                        _TRANSFER_EVENT_SIGNATURE, // Signature.
-                        0, // `address(0)`.
-                        toMasked, // `to`.
-                        tokenId // `tokenId`.
-                    )
-                }
-                // The `!=` check ensures that large values of `quantity`
-                // that overflows uint256 will make the loop run out of gas.
-            } while (++tokenId != end);
-
-            bytes memory _ownedBytes = _ownedIds[to];
-
-            _currentIndex = end;
-            for (uint256 i = 0; i < _currentIndex - startTokenId; i++) {
-                _ownedBytes = _ownedBytes.concat(abi.encodePacked(uint32(startTokenId + i)));
-            }
-
-            _ownedIds[to] = _ownedBytes;
+          i++;
         }
-        _afterTokenTransfers(address(0), to, startTokenId, quantity);
+      }
+
+      // If the sender's transaction changes their holding from a fractional to a non-fractional
+      // amount (or vice versa), adjust ERC-721s.
+      //
+      // Check if the send causes the sender to lose a whole token that was represented by an ERC-721
+      // due to a fractional part being transferred.
+      //
+      // To check this, look if subtracting the fractional amount from the balance causes the balance to
+      // drop below the original balance % units, which represents the number of whole tokens they started with.
+      uint256 fractionalAmount = value_ % units;
+
+      if (
+        (erc20BalanceOfSenderBefore - fractionalAmount) / units <
+        (erc20BalanceOfSenderBefore / units)
+      ) {
+        _withdrawAndStoreERC721(from_);
+      }
+
+      // Check if the receive causes the receiver to gain a whole new token that should be represented
+      // by an NFT due to receiving a fractional part that completes a whole token.
+      if (
+        (erc20BalanceOfReceiverBefore + fractionalAmount) / units >
+        (erc20BalanceOfReceiverBefore / units)
+      ) {
+        _retrieveOrMintERC721(to_);
+      }
     }
 
-    /**
-     * @dev Equivalent to `_burn(tokenId, false)`.
-     */
-    function _burn(uint256 tokenId) internal virtual {
-        _burn(tokenId, false);
+    return true;
+  }
+
+  /// @notice Internal function for ERC20 minting
+  /// @dev This function will allow minting of new ERC20s.
+  ///      If mintCorrespondingERC721s_ is true, and the recipient is not ERC-721 exempt, it will also mint the corresponding ERC721s.
+  /// Handles ERC-721 exemptions.
+  function _mintERC20(
+    address to_,
+    uint256 value_,
+    bool mintCorrespondingERC721s_
+  ) internal virtual {
+    /// You cannot mint to the zero address (you can't mint and immediately burn in the same transfer).
+    if (to_ == address(0)) {
+      revert InvalidRecipient();
     }
 
-    /**
-     * @dev Destroys `tokenId`.
-     * The approval is cleared when the token is burned.
-     *
-     * Requirements:
-     *
-     * - `tokenId` must exist.
-     *
-     * Emits a {Transfer} event.
-     */
-    function _burn(uint256 tokenId, bool approvalCheck) internal virtual {
-        uint256 prevOwnershipPacked = _packedOwnershipOf(tokenId);
+    _transferERC20(address(0), to_, value_);
 
-        address from = address(uint160(prevOwnershipPacked));
-
-        (uint256 approvedAddressSlot, address approvedAddress) = _getApprovedSlotAndAddress(tokenId);
-
-        if (approvalCheck) {
-            // The nested ifs save around 20+ gas over a compound boolean condition.
-            if (!_isSenderApprovedOrOwner(approvedAddress, from, _msgSenderERC721A())) {
-                if (!isApprovedForAll[from][_msgSenderERC721A()]) _revert(TransferCallerNotOwnerNorApproved.selector);
-            }
-        }
-
-        _beforeTokenTransfers(from, address(0), tokenId, 1);
-
-        // Clear approvals from the previous owner.
-        assembly {
-            if approvedAddress {
-                // This is equivalent to `delete _tokenApprovals[tokenId]`.
-                sstore(approvedAddressSlot, 0)
-            }
-        }
-
-        // Underflow of the sender's balance is impossible because we check for
-        // ownership above and the recipient's balance can't realistically overflow.
-        // Counter overflow is incredibly unrealistic as `tokenId` would have to be 2**256.
+    // If mintCorrespondingERC721s_ is true, and the recipient is not ERC-721 transfer exempt, mint the corresponding ERC721s.
+    if (mintCorrespondingERC721s_ && !erc721TransferExempt[to_]) {
+      uint256 nftsToRetrieveOrMint = value_ / units;
+      for (uint256 i = 0; i < nftsToRetrieveOrMint;) {
+        // ERC-721 exemptions handled above.
+        _retrieveOrMintERC721(to_);
         unchecked {
-            // Updates:
-            // - `balance -= 1`.
-            // - `numberBurned += 1`.
-            //
-            // We can directly decrement the balance, and increment the number burned.
-            // This is equivalent to `packed -= 1; packed += 1 << _BITPOS_NUMBER_BURNED;`.
-            _packedAddressData[from] += (1 << _BITPOS_NUMBER_BURNED) - 1;
-
-            // Updates:
-            // - `address` to the last owner.
-            // - `startTimestamp` to the timestamp of burning.
-            // - `burned` to `true`.
-            // - `nextInitialized` to `true`.
-            _packedOwnerships[tokenId] = _packOwnershipData(
-                from,
-                (_BITMASK_BURNED | _BITMASK_NEXT_INITIALIZED) | _nextExtraData(from, address(0), prevOwnershipPacked)
-            );
-
-            // If the next slot may not have been initialized (i.e. `nextInitialized == false`) .
-            if (prevOwnershipPacked & _BITMASK_NEXT_INITIALIZED == 0) {
-                uint256 nextTokenId = tokenId + 1;
-                // If the next slot's address is zero and not burned (i.e. packed value is zero).
-                if (_packedOwnerships[nextTokenId] == 0) {
-                    // If the next slot is within bounds.
-                    if (nextTokenId != _currentIndex) {
-                        // Initialize the next slot to maintain correctness for `ownerOf(tokenId + 1)`.
-                        _packedOwnerships[nextTokenId] = prevOwnershipPacked;
-                    }
-                }
-            }
+          i++;
         }
+      }
+    }
+  }
 
-        emit Transfer(from, address(0), tokenId);
-        _afterTokenTransfers(from, address(0), tokenId, 1);
-
-        // Overflow not possible, as _burnCounter cannot be exceed _currentIndex times.
-        unchecked {
-            _burnCounter++;
-        }
+  /// @notice Internal function for ERC-721 minting and retrieval from the bank.
+  /// @dev This function will allow minting of new ERC-721s up to the total fractional supply. It will
+  ///      first try to pull from the bank, and if the bank is empty, it will mint a new token.
+  /// Does not handle ERC-721 exemptions.
+  function _retrieveOrMintERC721(address to_) internal virtual {
+    if (to_ == address(0)) {
+      revert InvalidRecipient();
     }
 
-    function _setNameSymbol(string memory _name, string memory _symbol) internal {
-        name = _name;
-        symbol = _symbol;
+    uint256 id;
+
+    if (!DoubleEndedQueue.empty(_storedERC721Ids)) {
+      // If there are any tokens in the bank, use those first.
+      // Pop off the end of the queue (FIFO).
+      id = _storedERC721Ids.popBack();
+    } else {
+      // Otherwise, mint a new token, should not be able to go over the total fractional supply.
+      _minted++;
+      id = _minted;
     }
 
-    // =============================================================
-    //                     INTERNAL VITRUAL FUNCTIONS
-    // =============================================================
+    address erc721Owner = _getOwnerOf(id);
 
-    function _spendAllowance(address, address, uint256) internal virtual;
-
-    /**
-     * @dev Hook that is called before a set of serially-ordered token IDs
-     * are about to be transferred. This includes minting.
-     * And also called before burning one token.
-     *
-     * `startTokenId` - the first token ID to be transferred.
-     * `quantity` - the amount to be transferred.
-     *
-     * Calling conditions:
-     *
-     * - When `from` and `to` are both non-zero, `from`'s `tokenId` will be
-     * transferred to `to`.
-     * - When `from` is zero, `tokenId` will be minted for `to`.
-     * - When `to` is zero, `tokenId` will be burned by `from`.
-     * - `from` and `to` are never both zero.
-     */
-    function _beforeTokenTransfers(address from, address to, uint256 startTokenId, uint256 quantity) internal virtual {}
-
-    /**
-     * @dev Hook that is called after a set of serially-ordered token IDs
-     * have been transferred. This includes minting.
-     * And also called after one token has been burned.
-     *
-     * `startTokenId` - the first token ID to be transferred.
-     * `quantity` - the amount to be transferred.
-     *
-     * Calling conditions:
-     *
-     * - When `from` and `to` are both non-zero, `from`'s `tokenId` has been
-     * transferred to `to`.
-     * - When `from` is zero, `tokenId` has been minted for `to`.
-     * - When `to` is zero, `tokenId` has been burned by `from`.
-     * - `from` and `to` are never both zero.
-     */
-    function _afterTokenTransfers(address from, address to, uint256 startTokenId, uint256 quantity) internal virtual {}
-
-    // =============================================================
-    //                     INTERNAL ERC721A FUNCTIONS
-    // =============================================================
-
-    /**
-     * @dev For more efficient reverts.
-     */
-    function _revert(bytes4 errorSelector) internal pure {
-        assembly {
-            mstore(0x00, errorSelector)
-            revert(0x00, 0x04)
-        }
+    // The token should not already belong to anyone besides 0x0 or this contract.
+    // If it does, something is wrong, as this should never happen.
+    if (erc721Owner != address(0)) {
+      revert AlreadyExists();
     }
 
-    /**
-     * @dev Directly sets the extra data for the ownership data `index`.
-     */
-    function _setExtraDataAt(uint256 index, uint24 extraData) internal virtual {
-        uint256 packed = _packedOwnerships[index];
-        if (packed == 0) _revert(OwnershipNotInitializedForExtraData.selector);
-        uint256 extraDataCasted;
-        // Cast `extraData` with assembly to avoid redundant masking.
-        assembly {
-            extraDataCasted := extraData
-        }
-        packed = (packed & _BITMASK_EXTRA_DATA_COMPLEMENT) | (extraDataCasted << _BITPOS_EXTRA_DATA);
-        _packedOwnerships[index] = packed;
+    // Transfer the token to the recipient, either transferring from the contract's bank or minting.
+    // Does not handle ERC-721 exemptions.
+    _transferERC721(erc721Owner, to_, id);
+  }
+
+  /// @notice Internal function for ERC-721 deposits to bank (this contract).
+  /// @dev This function will allow depositing of ERC-721s to the bank, which can be retrieved by future minters.
+  // Does not handle ERC-721 exemptions.
+  function _withdrawAndStoreERC721(address from_) internal virtual {
+    if (from_ == address(0)) {
+      revert InvalidSender();
     }
 
-    /**
-     * @dev Called during each token transfer to set the 24bit `extraData` field.
-     * Intended to be overridden by the cosumer contract.
-     *
-     * `previousExtraData` - the value of `extraData` before transfer.
-     *
-     * Calling conditions:
-     *
-     * - When `from` and `to` are both non-zero, `from`'s `tokenId` will be
-     * transferred to `to`.
-     * - When `from` is zero, `tokenId` will be minted for `to`.
-     * - When `to` is zero, `tokenId` will be burned by `from`.
-     * - `from` and `to` are never both zero.
-     */
-    function _extraData(address from, address to, uint24 previousExtraData) internal view virtual returns (uint24) {}
+    // Retrieve the latest token added to the owner's stack (LIFO).
+    uint256 id = _owned[from_][_owned[from_].length - 1];
 
-    /**
-     * @dev Returns the next extra data for the packed ownership data.
-     * The returned result is shifted into position.
-     */
-    function _nextExtraData(address from, address to, uint256 prevOwnershipPacked) private view returns (uint256) {
-        uint24 extraData = uint24(prevOwnershipPacked >> _BITPOS_EXTRA_DATA);
-        return uint256(_extraData(from, to, extraData)) << _BITPOS_EXTRA_DATA;
+    // Transfer to 0x0.
+    // Does not handle ERC-721 exemptions.
+    _transferERC721(from_, address(0), id);
+
+    // Record the token in the contract's bank queue.
+    _storedERC721Ids.pushFront(id);
+  }
+
+  /// @notice Initialization function to set pairs / etc, saving gas by avoiding mint / burn on unnecessary targets
+  function _setERC721TransferExempt(address target_, bool state_) internal virtual {
+    // If the target has at least 1 full ERC-20 token, they should not be removed from the exempt list
+    // because if they were and then they attempted to transfer, it would revert as they would not
+    // necessarily have ehough ERC-721s to bank.
+    if (erc20BalanceOf(target_) >= units && !state_) {
+      revert CannotRemoveFromERC721TransferExempt();
     }
 
-    function _ownershipOf(uint256 tokenId) internal view virtual returns (TokenOwnership memory) {
-        return _unpackedOwnership(_packedOwnershipOf(tokenId));
+    erc721TransferExempt[target_] = state_;
+  }
+
+  function _getOwnerOf(
+    uint256 id_
+  ) internal view virtual returns (address ownerOf_) {
+    uint256 data = _ownedData[id_];
+
+    assembly {
+      ownerOf_ := and(data, _BITMASK_ADDRESS)
+    }
+  }
+
+  function _setOwnerOf(uint256 id_, address owner_) internal virtual {
+    uint256 data = _ownedData[id_];
+
+    assembly {
+      data := add(
+        and(data, _BITMASK_OWNED_INDEX),
+        and(owner_, _BITMASK_ADDRESS)
+      )
     }
 
-    /**
-     * @dev Returns the unpacked `TokenOwnership` struct from `packed`.
-     */
-    function _unpackedOwnership(uint256 packed) private pure returns (TokenOwnership memory ownership) {
-        ownership.addr = address(uint160(packed));
-        ownership.startTimestamp = uint64(packed >> _BITPOS_START_TIMESTAMP);
-        ownership.burned = packed & _BITMASK_BURNED != 0;
-        ownership.extraData = uint24(packed >> _BITPOS_EXTRA_DATA);
+    _ownedData[id_] = data;
+  }
+
+  function _getOwnedIndex(
+    uint256 id_
+  ) internal view virtual returns (uint256 ownedIndex_) {
+    uint256 data = _ownedData[id_];
+
+    assembly {
+      ownedIndex_ := shr(160, data)
+    }
+  }
+
+  function _setOwnedIndex(uint256 id_, uint256 index_) internal virtual {
+    uint256 data = _ownedData[id_];
+
+    if (index_ > _BITMASK_OWNED_INDEX >> 160) {
+      revert OwnedIndexOverflow();
     }
 
-    /**
-     * @dev Packs ownership data into a single uint256.
-     */
-    function _packOwnershipData(address owner, uint256 flags) private view returns (uint256 result) {
-        assembly {
-            // Mask `owner` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            owner := and(owner, _BITMASK_ADDRESS)
-            // `owner | (block.timestamp << _BITPOS_START_TIMESTAMP) | flags`.
-            result := or(owner, or(shl(_BITPOS_START_TIMESTAMP, timestamp()), flags))
-        }
+    assembly {
+      data := add(
+        and(data, _BITMASK_ADDRESS),
+        and(shl(160, index_), _BITMASK_OWNED_INDEX)
+      )
     }
 
-    /**
-     * @dev Returns the `nextInitialized` flag set if `quantity` equals 1.
-     */
-    function _nextInitializedFlag(uint256 quantity) private pure returns (uint256 result) {
-        // For branchless setting of the `nextInitialized` flag.
-        assembly {
-            // `(quantity == 1) << _BITPOS_NEXT_INITIALIZED`.
-            result := shl(_BITPOS_NEXT_INITIALIZED, eq(quantity, 1))
-        }
-    }
-
-    /**
-     * @dev Returns whether `msgSender` is equal to `approvedAddress` or `owner`.
-     */
-    function _isSenderApprovedOrOwner(address approvedAddress, address owner, address msgSender)
-        private
-        pure
-        returns (bool result)
-    {
-        assembly {
-            // Mask `owner` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            owner := and(owner, _BITMASK_ADDRESS)
-            // Mask `msgSender` to the lower 160 bits, in case the upper bits somehow aren't clean.
-            msgSender := and(msgSender, _BITMASK_ADDRESS)
-            // `msgSender == owner || msgSender == approvedAddress`.
-            result := or(eq(msgSender, owner), eq(msgSender, approvedAddress))
-        }
-    }
-
-    /**
-     * @dev Returns the storage slot and value for the approved address of `tokenId`.
-     */
-    function _getApprovedSlotAndAddress(uint256 tokenId)
-        private
-        view
-        returns (uint256 approvedAddressSlot, address approvedAddress)
-    {
-        TokenApprovalRef storage tokenApproval = _tokenApprovals[tokenId];
-        // The following is equivalent to `approvedAddress = _tokenApprovals[tokenId].value`.
-        assembly {
-            approvedAddressSlot := tokenApproval.slot
-            approvedAddress := sload(approvedAddressSlot)
-        }
-    }
-
-    /**
-     * Returns the packed ownership data of `tokenId`.
-     */
-    function _packedOwnershipOf(uint256 tokenId) private view returns (uint256 packed) {
-        if (_startTokenId() <= tokenId) {
-            packed = _packedOwnerships[tokenId];
-            // If the data at the starting slot does not exist, start the scan.
-            if (packed == 0) {
-                if (tokenId >= _currentIndex) _revert(OwnerQueryForNonexistentToken.selector);
-                // Invariant:
-                // There will always be an initialized ownership slot
-                // (i.e. `ownership.addr != address(0) && ownership.burned == false`)
-                // before an unintialized ownership slot
-                // (i.e. `ownership.addr == address(0) && ownership.burned == false`)
-                // Hence, `tokenId` will not underflow.
-                //
-                // We can directly compare the packed value.
-                // If the address is zero, packed will be zero.
-                for (;;) {
-                    unchecked {
-                        packed = _packedOwnerships[--tokenId];
-                    }
-                    if (packed == 0) continue;
-                    if (packed & _BITMASK_BURNED == 0) return packed;
-                    // Otherwise, the token is burned, and we must revert.
-                    // This handles the case of batch burned tokens, where only the burned bit
-                    // of the starting slot is set, and remaining slots are left uninitialized.
-                    _revert(OwnerQueryForNonexistentToken.selector);
-                }
-            }
-            // Otherwise, the data exists and we can skip the scan.
-            // This is possible because we have already achieved the target condition.
-            // This saves 2143 gas on transfers of initialized tokens.
-            // If the token is not burned, return `packed`. Otherwise, revert.
-            if (packed & _BITMASK_BURNED == 0) return packed;
-        }
-        _revert(OwnerQueryForNonexistentToken.selector);
-    }
-
-    /**
-     * @dev Returns the starting token ID.
-     * To change the starting token ID, please override this function.
-     */
-    function _startTokenId() internal view virtual returns (uint256) {
-        return 0;
-    }
-
-    /**
-     * @dev Returns the message sender (defaults to `msg.sender`).
-     *
-     * If you are writing GSN compatible contracts, you need to override this function.
-     */
-    function _msgSenderERC721A() internal view virtual returns (address) {
-        return msg.sender;
-    }
+    _ownedData[id_] = data;
+  }
 }

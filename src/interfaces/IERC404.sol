@@ -1,117 +1,94 @@
-// SPDX-License-Identifier: UNLICENSED
+//SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
-pragma solidity ^0.8.10;
+import {IERC165} from "./IERC165.sol";
 
-interface IERC404 {
-    // =============================================================
-    //                            EVENTS
-    // =============================================================
-    event ERC20Transfer(address indexed from, address indexed to, uint256 amount);
-    event Approval(address indexed owner, address indexed spender, uint256 amount);
-    event Transfer(address indexed from, address indexed to, uint256 indexed id);
-    event ERC721Approval(address indexed owner, address indexed spender, uint256 indexed id);
-    event ApprovalForAll(address indexed owner, address indexed operator, bool approved);
+interface IERC404 is IERC165 {
+  event ERC20Approval(address owner, address spender, uint256 value);
+  event ApprovalForAll(
+    address indexed owner,
+    address indexed operator,
+    bool approved
+  );
+  event ERC721Approval(
+    address indexed owner,
+    address indexed spender,
+    uint256 indexed id
+  );
+  event ERC20Transfer(address indexed from, address indexed to, uint256 amount);
+  event ERC721Transfer(
+    address indexed from,
+    address indexed to,
+    uint256 indexed id
+  );
 
-    // =============================================================
-    //                            ERRORS
-    // =============================================================
+  error NotFound();
+  error InvalidId();
+  error AlreadyExists();
+  error InvalidRecipient();
+  error InvalidSender();
+  error InvalidSpender();
+  error InvalidOperator();
+  error UnsafeRecipient();
+  error RecipientIsERC721TransferExempt();
+  error SenderIsERC721TransferExempt();
+  error Unauthorized();
+  error InsufficientAllowance();
+  error DecimalsTooLow();
+  error CannotRemoveFromERC721TransferExempt();
+  error PermitDeadlineExpired();
+  error InvalidSigner();
+  error InvalidApproval();
+  error OwnedIndexOverflow();
 
-    error NotFound();
-    error AlreadyExists();
-    error InvalidRecipient();
-    error InvalidSender();
-    error UnsafeRecipient();
-    error ApprovalCallerNotOwnerNorApproved();
-    error ApprovalQueryForNonexistentToken();
-    error BalanceQueryForZeroAddress();
-    error MintToZeroAddress();
-    error MintZeroQuantity();
-    error OwnerQueryForNonexistentToken();
-    error TransferCallerNotOwnerNorApproved();
-    error TransferFromIncorrectOwner();
-    error TransferToNonERC721ReceiverImplementer();
-    error TransferToZeroAddress();
-    error URIQueryForNonexistentToken();
-    error MintERC2309QuantityExceedsLimit();
-    error OwnershipNotInitializedForExtraData();
-
-    // =============================================================
-    //                            STRUCTS
-    // =============================================================
-
-    struct TokenOwnership {
-        // The address of the owner.
-        address addr;
-        // Stores the start time of ownership with minimal overhead for tokenomics.
-        uint64 startTimestamp;
-        // Whether the token has been burned.
-        bool burned;
-        // Arbitrary data similar to `startTimestamp` that can be set via {_extraData}.
-        uint24 extraData;
-    }
-
-    struct TokenApprovalRef {
-        address value;
-    }
-
-    // =============================================================
-    //                        EXTERNAL FUNCTIONS
-    // =============================================================
-
-    /// @dev Total supply in fractionalized representation
-    function totalSupply() external view returns (uint256);
-
-    /// @dev Current mint counter, monotonically increasing to ensure accurate ownership
-    function minted() external view returns (uint256);
-
-    /// @dev Balance of user in fractional representation
-    function balanceOf(address) external view returns (uint256);
-
-    /// @dev Allowance of user in fractional representation
-    function allowance(address, address) external view returns (uint256);
-
-    /// @dev Approval in native representaion
-    function getApproved(uint256) external view returns (address);
-
-    /// @dev Approval for all in native representation
-    function isApprovedForAll(address, address) external view returns (bool);
-
-    /// @dev Addresses whitelisted from minting / burning for gas savings (pairs, routers, etc)
-    function whitelist(address) external view returns (bool);
-
-    /// @dev Token name
-    function name() external view returns (string memory);
-
-    /// @dev Token symbol
-    function symbol() external view returns (string memory);
-
-    /// @notice Initialization function to set pairs / etc
-    ///         saving gas by avoiding mint / burn on unnecessary targets
-    function setWhitelist(address target, bool state) external;
-
-    /// @notice Function to find owner of a given native token
-    function ownerOf(uint256 id) external view returns (address owner);
-
-    /// @notice tokenURI must be implemented by child contract
-    function tokenURI(uint256 id) external view returns (string memory);
-
-    /// @notice Function for token approvals
-    /// @dev This function assumes id / native if amount less than or equal to current max id
-    function approve(address spender, uint256 amountOrId) external returns (bool);
-
-    /// @notice Function native approvals
-    function setApprovalForAll(address operator, bool approved) external;
-
-    /// @notice Function for mixed transfers
-    /// @dev This function assumes id / native if amount less than or equal to current max id
-    function transferFrom(address from, address to, uint256 amountOrId) external;
-
-    /// @notice Function for fractional transfers
-    function transfer(address to, uint256 amount) external returns (bool);
-
-    /// @notice Function for native transfers with contract support
-    function safeTransferFrom(address from, address to, uint256 id) external;
-
-    /// @notice Function for native transfers with contract support and callback data
-    function safeTransferFrom(address from, address to, uint256 id, bytes calldata data) external;
+  function name() external view returns (string memory);
+  function symbol() external view returns (string memory);
+  function decimals() external view returns (uint8);
+  function totalSupply() external view returns (uint256);
+  function erc20TotalSupply() external view returns (uint256);
+  function erc721TotalSupply() external view returns (uint256);
+  function balanceOf(address owner_) external view returns (uint256);
+  function erc721BalanceOf(address owner_) external view returns (uint256);
+  function erc20BalanceOf(address owner_) external view returns (uint256);
+  function erc721TransferExempt(address account_) external view returns (bool);
+  function isApprovedForAll(
+    address owner_,
+    address operator_
+  ) external view returns (bool);
+  function allowance(
+    address owner_,
+    address spender_
+  ) external view returns (uint256);
+  function owned(address owner_) external view returns (uint256[] memory);
+  function ownerOf(uint256 id_) external view returns (address erc721Owner);
+  function tokenURI(uint256 id_) external view returns (string memory);
+  function approve(
+    address spender_,
+    uint256 valueOrId_
+  ) external returns (bool);
+  function setApprovalForAll(address operator_, bool approved_) external;
+  function transferFrom(
+    address from_,
+    address to_,
+    uint256 valueOrId_
+  ) external returns (bool);
+  function transfer(address to_, uint256 amount_) external returns (bool);
+  function erc721TokensBankedInQueue() external view returns (uint256);
+  function safeTransferFrom(address from_, address to_, uint256 id_) external;
+  function safeTransferFrom(
+    address from_,
+    address to_,
+    uint256 id_,
+    bytes calldata data_
+  ) external;
+  function DOMAIN_SEPARATOR() external view returns (bytes32);
+  function permit(
+    address owner_,
+    address spender_,
+    uint256 value_,
+    uint256 deadline_,
+    uint8 v_,
+    bytes32 r_,
+    bytes32 s_
+  ) external;
 }
