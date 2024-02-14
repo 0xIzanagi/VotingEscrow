@@ -10,7 +10,7 @@ import {IERC404Vault} from "./interfaces/IERC404Vault.sol";
 import {Math} from "./utils/math.sol";
 import {Context} from "./utils/Context.sol";
 
-contract ERC404Vault is Context, ERC404, IERC404Vault {
+abstract contract ERC404Vault is Context, ERC404, IERC404Vault {
     using Math for uint256;
     /**
      * @dev Attempted to deposit more assets than the max amount for `receiver`.
@@ -148,7 +148,7 @@ contract ERC404Vault is Context, ERC404, IERC404Vault {
         if (assets > maxAssets) {
             revert ERC404ExceededMaxDeposit(receiver, assets, maxAssets);
         }
-        
+
         uint256 shares = previewDeposit(assets);
         _depositNFT(_msgSender(), receiver, assets, shares, id);
         return shares;
@@ -225,12 +225,15 @@ contract ERC404Vault is Context, ERC404, IERC404Vault {
         // assets are transferred and before the shares are minted, which is a valid state.
         // slither-disable-next-line reentrancy-no-eth
         _asset.transferFrom(caller, address(this), assets);
-       //_mint(receiver, shares);
+        //_mint(receiver, shares);
 
         emit Deposit(caller, receiver, assets, shares);
     }
 
-    function _depositNFT(address caller, address receiver, uint256 assets, uint256 shares, uint256 id) internal virtual {
+    function _depositNFT(address caller, address receiver, uint256 assets, uint256 shares, uint256 id)
+        internal
+        virtual
+    {
         _asset.transferFrom(caller, address(this), id);
 
         emit DepositNFT(caller, receiver, assets, shares, id);
